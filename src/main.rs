@@ -306,7 +306,17 @@ async fn proxy_segment(
 ) -> Result<(Bytes, String)> {
     let extra = decode_headers(headers_b64);
     let resp = upstream_get(url, &extra).await?;
+    
+    // Peek at the upstream content-length to detect tiny key files.
+    // AES-128 keys are always exactly 16 bytes. Return them as octet-stream
+    // so HLS.js accepts them correctly without trying to parse as video/mp4.
+    let content_length = resp.content_length().unwrap_or(0);
     let data = resp.bytes().await.context("reading segment body")?;
+    
+    // AES-128 keys are exactly 16 bytes — serve as octet-stream, not video/mp4
+    if data.len() == 16 || content_length == 16 {
+        return Ok((data, "application/octet-stream".to_string()));
+    }
 
     if !transcode {
         return Ok((data, "video/mp4".to_string()));
