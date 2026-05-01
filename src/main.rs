@@ -300,7 +300,7 @@ async fn fetch_and_cache(
     };
 
     let content_length = resp.content_length().unwrap_or(0);
-    let data = match resp.bytes().await {
+    let raw = match resp.bytes().await {
         Ok(b) => b,
         Err(e) => {
             warn!("prefetch body read failed: {e}");
@@ -308,6 +308,17 @@ async fn fetch_and_cache(
             return;
         }
     };
+
+    // Kiwi / owocdn.top: unwrap base64-JSON segment envelope (same logic as proxy_segment)
+    let data = if raw.first() == Some(&b'{') {
+        if let Ok(text) = std::str::from_utf8(&raw) {
+            if let Ok(val) = serde_json::from_str::<serde_json::Value>(text) {
+                if let Some(b64_str) = val.get("data").and_then(|v| v.as_str()) {
+                    B64.decode(b64_str).map(Bytes::from).unwrap_or(raw)
+                } else { raw }
+            } else { raw }
+        } else { raw }
+    } else { raw };
 
     let (data, content_type) = if data.len() == 16 || content_length == 16 {
         (data, "application/octet-stream".to_string())
@@ -774,7 +785,40 @@ async fn proxy_segment(
     let resp = upstream_get(url, &extra).await?;
 
     let content_length = resp.content_length().unwrap_or(0);
-    let data = resp.bytes().await.context("reading segment body")?;
+    let raw = resp.bytes().await.context("reading segment body")?;
+
+    // ── Kiwi / owocdn.top base64-JSON unwrapping ─────────────────────────────
+    // owocdn.top (used by kiwi provider) wraps fMP4 segments in a JSON envelope:
+    //   {"data":"AAAAIGZ0eXBpc..."}
+    // where the value is standard base64-encoded binary. HLS.js gets garbage
+    // if we pass the JSON through directly — detect and unwrap it here.
+    let data = if raw.first() == Some(&b'{') {
+        // Looks like JSON — try to parse {"data": "<base64>"}
+        if let Ok(text) = std::str::from_utf8(&raw) {
+            if let Ok(val) = serde_json::from_str::<serde_json::Value>(text) {
+                if let Some(b64_str) = val.get("data").and_then(|v| v.as_str()) {
+                    match B64.decode(b64_str) {
+                        Ok(decoded) => {
+                            info!("kiwi: unwrapped base64-JSON segment ({} → {} bytes)", raw.len(), decoded.len());
+                            Bytes::from(decoded)
+                        }
+                        Err(e) => {
+                            warn!("kiwi: JSON looked like base64-wrapper but decode failed: {e}");
+                            raw
+                        }
+                    }
+                } else {
+                    raw
+                }
+            } else {
+                raw
+            }
+        } else {
+            raw
+        }
+    } else {
+        raw
+    };
 
     // AES-128 keys are exactly 16 bytes
     if data.len() == 16 || content_length == 16 {
