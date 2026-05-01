@@ -243,14 +243,16 @@ fn maybe_decode_base64(raw: Bytes) -> Bytes {
         Err(_) => return raw,
     };
 
-    // Must consist only of base64 alphabet characters
-    if !text.bytes().all(|b| matches!(b, b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'+' | b'/' | b'=' | b'\n' | b'\r')) {
+    // Must consist only of base64 alphabet characters (standard or URL-safe)
+    if !text.bytes().all(|b| matches!(b, b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'+' | b'/' | b'=' | b'-' | b'_' | b'\n' | b'\r')) {
         return raw;
     }
 
-    // Attempt decode
+    // Attempt decode — try URL-safe first, then standard
     let stripped = text.replace([' ', '\n', '\r'], "");
-    match B64.decode(&stripped) {
+    // Normalise URL-safe base64 → standard base64 for decoding
+    let normalised = stripped.replace('-', "+").replace('_', "/");
+    match B64.decode(&normalised) {
         Ok(decoded) if !decoded.is_empty() => {
             info!("zaza: decoded naked base64 segment ({} → {} bytes)", raw.len(), decoded.len());
             Bytes::from(decoded)
