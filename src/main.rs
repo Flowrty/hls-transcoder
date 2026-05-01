@@ -62,6 +62,10 @@ type SegmentCache = Arc<Mutex<HashMap<String, CacheEntry>>>;
 /// keyed by the manifest URL. Used to know what to prefetch next.
 type PlaylistIndex = Arc<Mutex<HashMap<String, Vec<String>>>>;
 
+/// Cached rewritten manifest bodies, keyed by manifest URL.
+/// Serves stale manifest to VLC when upstream has expired, preserving #EXT-X-ENDLIST.
+type ManifestCache = Arc<Mutex<HashMap<String, (String, Instant)>>>;
+
 /// URLs currently being fetched — prevents duplicate concurrent upstream requests
 /// for the same segment when two prefetch waves overlap.
 type InFlight = Arc<Mutex<std::collections::HashSet<String>>>;
@@ -70,6 +74,7 @@ struct AppState {
     cache: SegmentCache,
     playlists: PlaylistIndex,
     in_flight: InFlight,
+    manifests: ManifestCache,
 }
 
 // ── Shared HTTP client ────────────────────────────────────────────────────────
@@ -118,6 +123,7 @@ async fn main() {
         cache: Arc::new(Mutex::new(HashMap::new())),
         playlists: Arc::new(Mutex::new(HashMap::new())),
         in_flight: Arc::new(Mutex::new(std::collections::HashSet::new())),
+        manifests: Arc::new(Mutex::new(HashMap::new())),
     });
 
     let cors = CorsLayer::new()
@@ -355,7 +361,7 @@ async fn handle_manifest(
     axum::extract::State(state): axum::extract::State<Arc<AppState>>,
     Query(params): Query<ProxyParams>,
 ) -> Response {
-    match proxy_manifest(&params.url, params.headers.as_deref(), &state.playlists).await {
+    match proxy_manifest(&params.url, params.headers.as_deref(), &state.playlists, &state.manifests).await {
         Ok((body, content_type)) => {
             let mut headers = HeaderMap::new();
             headers.insert(
@@ -383,9 +389,21 @@ async fn proxy_manifest(
     url: &str,
     headers_b64: Option<&str>,
     playlists: &PlaylistIndex,
+    manifests: &ManifestCache,
 ) -> Result<(String, String)> {
     let extra = decode_headers(headers_b64);
-    let resp = upstream_get(url, &extra).await?;
+    let resp = match upstream_get(url, &extra).await {
+        Ok(r) => r,
+        Err(e) => {
+            // Upstream failed (expired token etc.) — serve cached manifest if we have one
+            let cached = manifests.lock().await;
+            if let Some((body, _)) = cached.get(url) {
+                info!("upstream manifest failed ({e}), serving cached manifest for {url}");
+                return Ok((body.clone(), "application/vnd.apple.mpegurl".to_string()));
+            }
+            return Err(e);
+        }
+    };
     let body = resp.text().await?;
 
     if !body.trim_start().starts_with("#EXTM3U") {
@@ -423,9 +441,25 @@ async fn proxy_manifest(
 
         if is_url_line(trimmed) {
             let resolved = resolve_url(url, trimmed);
+            // Detect sub-manifests: either flagged by #EXT-X-STREAM-INF above,
+            // or the URL looks like a manifest (contains .m3u8, playlist, or
+            // ends with a query-only path like "/?u=" which krussdomi uses).
             let is_sub_manifest = next_line_is_stream
                 || resolved.contains(".m3u8")
-                || resolved.contains("playlist");
+                || resolved.contains("playlist")
+                || resolved.contains("index.m3u8")
+                || {
+                    // Heuristic: if the URL path (ignoring query) has no file
+                    // extension at all, it's likely a manifest endpoint.
+                    if let Ok(parsed) = url::Url::parse(&resolved) {
+                        let path = parsed.path();
+                        let last_seg = path.split('/').next_back().unwrap_or("");
+                        // No extension in last path segment AND has query params → manifest
+                        !last_seg.contains('.') && parsed.query().is_some()
+                    } else {
+                        false
+                    }
+                };
             next_line_is_stream = false;
 
             let endpoint = if is_sub_manifest { "manifest" } else { "segment" };
@@ -450,6 +484,12 @@ async fn proxy_manifest(
     if !segment_urls.is_empty() {
         let mut pl = playlists.lock().await;
         pl.insert(url.to_string(), segment_urls);
+    }
+
+    // Cache the rewritten manifest so VLC gets a consistent response on re-polls
+    {
+        let mut mc = manifests.lock().await;
+        mc.insert(url.to_string(), (out.clone(), Instant::now()));
     }
 
     Ok((out, "application/vnd.apple.mpegurl".to_string()))
