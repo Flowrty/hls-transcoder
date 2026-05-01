@@ -212,6 +212,53 @@ fn manifest_has_heaac(manifest: &str) -> bool {
     manifest.contains("mp4a.40.1") || manifest.contains("MP4A.40.1")
 }
 
+/// Detect and decode a naked base64 response body from zaza/kiwi CDN proxies.
+///
+/// These CDNs return segment bodies (fMP4, TS, AES-128 keys) as raw base64 text
+/// instead of binary — no JSON wrapper, just the base64 string as the entire body.
+///
+/// Detection strategy (in order):
+///  1. Body must be valid UTF-8.
+///  2. Body must consist only of base64 alphabet chars (A-Z a-z 0-9 + / = \n \r).
+///  3. Body must decode without error.
+///  4. The DECODED bytes must NOT start with base64 alphabet chars again
+///     (avoids double-decoding).
+///  5. The first byte of the ENCODED body must NOT be a known binary magic byte
+///     (0x47 = TS sync, ftyp box starts with 0x00 0x00 0x00 which is not base64).
+///
+/// If all checks pass, returns decoded bytes. Otherwise returns input unchanged.
+fn maybe_decode_base64(raw: Bytes) -> Bytes {
+    // Quick binary-magic-byte check: if the very first byte is definitely binary,
+    // skip straight to returning raw. Base64 chars start at 0x2B (+).
+    if let Some(&first) = raw.first() {
+        // TS sync byte, or null/SOH/STX common in fMP4 boxes
+        if first == 0x47 || first < 0x20 {
+            return raw;
+        }
+    }
+
+    // Must be valid UTF-8
+    let text = match std::str::from_utf8(&raw) {
+        Ok(t) => t.trim(),
+        Err(_) => return raw,
+    };
+
+    // Must consist only of base64 alphabet characters
+    if !text.bytes().all(|b| matches!(b, b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'+' | b'/' | b'=' | b'\n' | b'\r')) {
+        return raw;
+    }
+
+    // Attempt decode
+    let stripped = text.replace([' ', '\n', '\r'], "");
+    match B64.decode(&stripped) {
+        Ok(decoded) if !decoded.is_empty() => {
+            info!("zaza: decoded naked base64 segment ({} → {} bytes)", raw.len(), decoded.len());
+            Bytes::from(decoded)
+        }
+        _ => raw,
+    }
+}
+
 fn self_url(endpoint: &str, target: &str, headers_b64: &str, transcode: bool) -> String {
     let base = service_base_url();
     let encoded = urlencoding::encode(target);
@@ -309,16 +356,8 @@ async fn fetch_and_cache(
         }
     };
 
-    // Kiwi / owocdn.top: unwrap base64-JSON segment envelope (same logic as proxy_segment)
-    let data = if raw.first() == Some(&b'{') {
-        if let Ok(text) = std::str::from_utf8(&raw) {
-            if let Ok(val) = serde_json::from_str::<serde_json::Value>(text) {
-                if let Some(b64_str) = val.get("data").and_then(|v| v.as_str()) {
-                    B64.decode(b64_str).map(Bytes::from).unwrap_or(raw)
-                } else { raw }
-            } else { raw }
-        } else { raw }
-    } else { raw };
+    // zaza naked base64 unwrapping (same logic as proxy_segment)
+    let data = maybe_decode_base64(raw);
 
     let (data, content_type) = if data.len() == 16 || content_length == 16 {
         (data, "application/octet-stream".to_string())
@@ -787,38 +826,15 @@ async fn proxy_segment(
     let content_length = resp.content_length().unwrap_or(0);
     let raw = resp.bytes().await.context("reading segment body")?;
 
-    // ── Kiwi / owocdn.top base64-JSON unwrapping ─────────────────────────────
-    // owocdn.top (used by kiwi provider) wraps fMP4 segments in a JSON envelope:
-    //   {"data":"AAAAIGZ0eXBpc..."}
-    // where the value is standard base64-encoded binary. HLS.js gets garbage
-    // if we pass the JSON through directly — detect and unwrap it here.
-    let data = if raw.first() == Some(&b'{') {
-        // Looks like JSON — try to parse {"data": "<base64>"}
-        if let Ok(text) = std::str::from_utf8(&raw) {
-            if let Ok(val) = serde_json::from_str::<serde_json::Value>(text) {
-                if let Some(b64_str) = val.get("data").and_then(|v| v.as_str()) {
-                    match B64.decode(b64_str) {
-                        Ok(decoded) => {
-                            info!("kiwi: unwrapped base64-JSON segment ({} → {} bytes)", raw.len(), decoded.len());
-                            Bytes::from(decoded)
-                        }
-                        Err(e) => {
-                            warn!("kiwi: JSON looked like base64-wrapper but decode failed: {e}");
-                            raw
-                        }
-                    }
-                } else {
-                    raw
-                }
-            } else {
-                raw
-            }
-        } else {
-            raw
-        }
-    } else {
-        raw
-    };
+    // ── zaza.animex.one naked base64 unwrapping ──────────────────────────────
+    // zaza (and similar CDN proxies used by AnimePahe/kiwi) return segment bodies
+    // as raw base64-encoded text — no JSON wrapper, just a naked base64 string.
+    // e.g. AES-128 key:  "Exy20J8KdwRyZwK33DXo1Q=="  (24 chars → 16 bytes)
+    //      fMP4 segment: "cvyJ0aTFSFLNZpBY..."        (large base64 blob)
+    // Detect: entire body is valid base64 printable chars and decodes cleanly.
+    // We only attempt this when the body does NOT start with known binary magic
+    // bytes (ftyp = 0x66747970, TS sync = 0x47, EBML = 0x1a45dfa3).
+    let data = maybe_decode_base64(raw);
 
     // AES-128 keys are exactly 16 bytes
     if data.len() == 16 || content_length == 16 {
