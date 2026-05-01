@@ -130,12 +130,15 @@ fn resolve_url(base: &str, href: &str) -> String {
     if href.starts_with("http://") || href.starts_with("https://") {
         return href.to_string();
     }
+    // The base URL here is the upstream manifest URL (e.g. zaza.animex.one/?u=...)
+    // NOT the transcoder's own SERVICE_BASE_URL. Resolve relative hrefs against it.
     if let Ok(base_url) = url::Url::parse(base) {
         if let Ok(resolved) = base_url.join(href) {
             return resolved.to_string();
         }
     }
-    href.to_string()
+    // Last resort: treat as absolute
+    format!("https:{href}")
 }
 
 fn manifest_has_heaac(manifest: &str) -> bool {
@@ -196,9 +199,15 @@ async fn proxy_manifest(url: &str, headers_b64: Option<&str>) -> Result<(String,
 
     let headers_b64_str = headers_b64.unwrap_or("");
     let mut out = String::with_capacity(body.len() + 512);
+    let mut next_line_is_stream = false;
 
     for line in body.lines() {
         let trimmed = line.trim();
+
+        // Track whether the next URL line is a sub-manifest (rendition playlist)
+        if trimmed.starts_with("#EXT-X-STREAM-INF") || trimmed.starts_with("#EXT-X-I-FRAME-STREAM-INF") {
+            next_line_is_stream = true;
+        }
 
         // Rewrite URI="..." inside tags (EXT-X-KEY, EXT-X-MAP, etc.)
         if trimmed.starts_with('#') && trimmed.contains("URI=\"") {
@@ -211,17 +220,22 @@ async fn proxy_manifest(url: &str, headers_b64: Option<&str>) -> Result<(String,
         // Rewrite bare segment / sub-manifest lines
         if is_url_line(trimmed) {
             let resolved = resolve_url(url, trimmed);
-            let endpoint = if resolved.contains(".m3u8") || resolved.contains("playlist") {
-                "manifest"
-            } else {
-                "segment"
-            };
+            // A line is a sub-manifest if:
+            //  - preceded by #EXT-X-STREAM-INF, OR
+            //  - URL contains .m3u8 or "playlist"
+            let is_sub_manifest = next_line_is_stream
+                || resolved.contains(".m3u8")
+                || resolved.contains("playlist");
+            next_line_is_stream = false;
+
+            let endpoint = if is_sub_manifest { "manifest" } else { "segment" };
             let rewritten = self_url(endpoint, &resolved, headers_b64_str, needs_transcode);
             out.push_str(&rewritten);
             out.push('\n');
             continue;
         }
 
+        next_line_is_stream = false;
         out.push_str(line);
         out.push('\n');
     }
