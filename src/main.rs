@@ -40,8 +40,9 @@ use tracing::{error, info, warn};
 /// 8 segments × ~10s each = ~80s of buffer, enough for a 10s skip with margin.
 const PREFETCH_AHEAD: usize = 8;
 
-/// Max segments to keep in RAM. Each segment ~400 KB → 100 segments ≈ 40 MB.
-const CACHE_MAX_SEGMENTS: usize = 100;
+/// Max segments to keep in RAM. Each segment ~400 KB → 30 segments ≈ 12 MB.
+/// Kept low for Koyeb free tier (512 MB RAM total).
+const CACHE_MAX_SEGMENTS: usize = 30;
 
 /// Evict cache entries older than this (covers a full episode).
 const CACHE_TTL: Duration = Duration::from_secs(3600);
