@@ -371,6 +371,9 @@ async fn fetch_and_cache(
             }
         }
     } else {
+        // Pass raw bytes through — do NOT remux encrypted segments.
+        // Remuxing AES-128 encrypted fMP4 without decrypting first destroys
+        // the encryption framing, causing HLS.js fragParsingError.
         (data, "video/mp4".to_string())
     };
 
@@ -869,6 +872,45 @@ async fn proxy_segment(
 }
 
 // ── FFmpeg ────────────────────────────────────────────────────────────────────
+
+/// Re-mux the segment through ffmpeg with proper fMP4 fragmentation flags,
+/// without touching audio/video codecs. This fixes browser/HLS.js playback
+/// of segments that MPV plays fine but web players reject.
+async fn ffmpeg_remux(input: Bytes) -> Result<Bytes> {
+    let mut child = Command::new("ffmpeg")
+        .args([
+            "-hide_banner",
+            "-loglevel", "error",
+            "-i", "pipe:0",
+            "-c:v", "copy",
+            "-c:a", "copy",
+            "-movflags", "frag_keyframe+empty_moov+default_base_moof",
+            "-f", "mp4",
+            "pipe:1",
+        ])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .context("failed to spawn ffmpeg — is it installed?")?;
+
+    let stdin = child.stdin.take().ok_or_else(|| anyhow!("no stdin"))?;
+    tokio::io::AsyncWriteExt::write_all(
+        &mut tokio::io::BufWriter::new(stdin),
+        &input,
+    )
+    .await
+    .context("writing to ffmpeg stdin")?;
+
+    let output = child.wait_with_output().await.context("ffmpeg wait")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(anyhow!("ffmpeg remux exited {}: {stderr}", output.status));
+    }
+
+    Ok(Bytes::from(output.stdout))
+}
 
 async fn ffmpeg_transcode(input: Bytes) -> Result<Bytes> {
     let mut child = Command::new("ffmpeg")
