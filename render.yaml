@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: hls-transcoder
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /health
+    envVars:
+      - key: SERVICE_BASE_URL
+        sync: false  # Set this manually in Render dashboard to your service URL
+      - key: PORT
+        value: 3001
+      - key: RUST_LOG
+        value: hls_transcoder=info
