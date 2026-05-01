@@ -358,6 +358,35 @@ fn spawn_prefetch(
 
 // ── /manifest ─────────────────────────────────────────────────────────────────
 
+/// Decide whether a resolved URL from a manifest line is a sub-manifest (→ /manifest)
+/// or a media segment (→ /segment).
+///
+/// Rules (in priority order):
+///  1. Contains ".m3u8"              — always a manifest
+///  2. Contains "playlist"           — always a manifest
+///  3. Same host as the base URL AND path is just "/" or empty AND has a query string
+///     → proxy servers like zaza.animex.one serve every resource (manifest or segment)
+///       via query params on the root path; when a line resolves to the same host with
+///       only a query string it is a quality-variant sub-manifest, never raw media.
+///  4. Everything else               — treat as a segment
+fn url_is_sub_manifest(base_url: &str, resolved: &str) -> bool {
+    // Rule 1 & 2 — explicit manifest path markers
+    if resolved.contains(".m3u8") || resolved.contains("playlist") {
+        return true;
+    }
+
+    // Rule 3 — same-host, query-only (e.g. zaza.animex.one quality variants)
+    if let (Ok(base), Ok(res)) = (url::Url::parse(base_url), url::Url::parse(resolved)) {
+        let same_host = base.host_str() == res.host_str();
+        let query_only = (res.path() == "/" || res.path().is_empty()) && res.query().is_some();
+        if same_host && query_only {
+            return true;
+        }
+    }
+
+    false
+}
+
 async fn handle_manifest(
     axum::extract::State(state): axum::extract::State<Arc<AppState>>,
     Query(params): Query<ProxyParams>,
@@ -442,28 +471,7 @@ async fn proxy_manifest(
 
         if is_url_line(trimmed) {
             let resolved = resolve_url(url, trimmed);
-            // Detect sub-manifests: either flagged by #EXT-X-STREAM-INF above,
-            // or the URL explicitly contains a manifest path marker, or it is a
-            // query-only variant of the same host as the base manifest URL
-            // (e.g. zaza.animex.one returns quality variants as "?u=NEW&origin=...")
-            // which are always sub-manifests, never raw segments.
-            let same_host_query_only = {
-                let base_host = url::Url::parse(url).ok().and_then(|u| u.host_str().map(|h| h.to_string()));
-                let resolved_parsed = url::Url::parse(&resolved).ok();
-                match (base_host, resolved_parsed) {
-                    (Some(bh), Some(rp)) => {
-                        let same_host = rp.host_str() == Some(bh.as_str());
-                        let query_only = rp.path() == "/" || rp.path().is_empty();
-                        same_host && query_only && rp.query().is_some()
-                    }
-                    _ => false,
-                }
-            };
-            let is_sub_manifest = next_line_is_stream
-                || resolved.contains(".m3u8")
-                || resolved.contains("playlist")
-                || resolved.contains("index.m3u8")
-                || same_host_query_only;
+            let is_sub_manifest = next_line_is_stream || url_is_sub_manifest(url, &resolved);
             next_line_is_stream = false;
 
             let endpoint = if is_sub_manifest { "manifest" } else { "segment" };
