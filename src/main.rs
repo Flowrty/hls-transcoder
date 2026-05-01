@@ -147,9 +147,16 @@ fn manifest_has_heaac(manifest: &str) -> bool {
 
 fn self_url(endpoint: &str, target: &str, headers_b64: &str, transcode: bool) -> String {
     let base = service_base_url();
+    // Double-encode the target URL so special chars (& ? =) in zaza ?u= tokens
+    // don't get parsed as separate query params by the browser or Render's proxy.
     let encoded = urlencoding::encode(target);
     let t = if transcode { "1" } else { "0" };
-    format!("{base}/{endpoint}?url={encoded}&headers={headers_b64}&transcode={t}")
+    // headers_b64 may be empty string — only include if non-empty
+    if headers_b64.is_empty() {
+        format!("{base}/{endpoint}?url={encoded}&transcode={t}")
+    } else {
+        format!("{base}/{endpoint}?url={encoded}&headers={headers_b64}&transcode={t}")
+    }
 }
 
 // ── /manifest ─────────────────────────────────────────────────────────────────
