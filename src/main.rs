@@ -588,6 +588,10 @@ async fn proxy_manifest(
         info!("HE-AAC detected in manifest — segments will be transcoded");
     }
 
+    // Log whether the upstream manifest has an EXT-X-KEY line
+    let raw_key = body.lines().find(|l| l.contains("EXT-X-KEY"));
+    info!("upstream manifest EXT-X-KEY: {:?}", raw_key);
+
     let body = body.replace("mp4a.40.1", "mp4a.40.2");
 
     let headers_b64_str = headers_b64.unwrap_or("");
