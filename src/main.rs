@@ -443,24 +443,11 @@ async fn proxy_manifest(
         if is_url_line(trimmed) {
             let resolved = resolve_url(url, trimmed);
             // Detect sub-manifests: either flagged by #EXT-X-STREAM-INF above,
-            // or the URL looks like a manifest (contains .m3u8, playlist, or
-            // ends with a query-only path like "/?u=" which krussdomi uses).
+            // or the URL explicitly contains a manifest path marker.
             let is_sub_manifest = next_line_is_stream
                 || resolved.contains(".m3u8")
                 || resolved.contains("playlist")
-                || resolved.contains("index.m3u8")
-                || {
-                    // Heuristic: if the URL path (ignoring query) has no file
-                    // extension at all, it's likely a manifest endpoint.
-                    if let Ok(parsed) = url::Url::parse(&resolved) {
-                        let path = parsed.path();
-                        let last_seg = path.split('/').next_back().unwrap_or("");
-                        // No extension in last path segment AND has query params → manifest
-                        !last_seg.contains('.') && parsed.query().is_some()
-                    } else {
-                        false
-                    }
-                };
+                || resolved.contains("index.m3u8");
             next_line_is_stream = false;
 
             let endpoint = if is_sub_manifest { "manifest" } else { "segment" };
