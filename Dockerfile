@@ -1,5 +1,5 @@
 # ── Build stage ───────────────────────────────────────────────────────────────
-FROM rust:1.78-slim-bookworm AS builder
+FROM rust:1.82-slim-bookworm AS builder
 
 WORKDIR /app
 
@@ -8,7 +8,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libssl-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy everything and build in one shot
 COPY . .
 RUN cargo build --release
 
