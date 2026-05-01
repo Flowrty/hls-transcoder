@@ -151,9 +151,16 @@ async fn main() {
 
 #[derive(Deserialize)]
 struct ProxyParams {
-    url: String,
+    /// Direct upstream URL. Optional when `manifest_url`+`seq` are present.
+    url: Option<String>,
     headers: Option<String>,
     transcode: Option<String>,
+    /// Segment sequence index within the playlist (0-based).
+    /// When present together with `manifest_url`, the actual upstream segment
+    /// URL is re-resolved at fetch time so stale signed tokens are never used.
+    seq: Option<usize>,
+    /// Media-playlist URL used to re-resolve the segment at fetch time.
+    manifest_url: Option<String>,
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -213,6 +220,20 @@ fn self_url(endpoint: &str, target: &str, headers_b64: &str, transcode: bool) ->
         format!("{base}/{endpoint}?url={encoded}&transcode={t}")
     } else {
         format!("{base}/{endpoint}?url={encoded}&headers={headers_b64}&transcode={t}")
+    }
+}
+
+/// Build a segment URL that embeds the media-playlist URL + sequence index
+/// instead of the raw upstream segment URL. This lets /segment re-fetch a
+/// fresh signed token at request time rather than using a baked-in stale one.
+fn self_segment_url_by_seq(playlist_url: &str, seq: usize, headers_b64: &str, transcode: bool) -> String {
+    let base = service_base_url();
+    let encoded_playlist = urlencoding::encode(playlist_url);
+    let t = if transcode { "1" } else { "0" };
+    if headers_b64.is_empty() {
+        format!("{base}/segment?manifest_url={encoded_playlist}&seq={seq}&transcode={t}")
+    } else {
+        format!("{base}/segment?manifest_url={encoded_playlist}&seq={seq}&headers={headers_b64}&transcode={t}")
     }
 }
 
@@ -356,6 +377,42 @@ fn spawn_prefetch(
     });
 }
 
+/// After serving a seq-based segment, kick off background fetches for the next
+/// PREFETCH_AHEAD segments by re-resolving their URLs from the playlist.
+/// Each segment gets a fresh signed token at fetch time.
+fn spawn_prefetch_by_seq(
+    playlist_url: String,
+    current_seq: usize,
+    headers_b64: String,
+    transcode: bool,
+    cache: SegmentCache,
+    in_flight: InFlight,
+) {
+    tokio::spawn(async move {
+        for offset in 1..=PREFETCH_AHEAD {
+            let seq = current_seq + offset;
+            let pl = playlist_url.clone();
+            let hb = headers_b64.clone();
+            let c = cache.clone();
+            let f = in_flight.clone();
+            tokio::spawn(async move {
+                let upstream_url = match resolve_segment_url_from_playlist(&pl, seq, &hb).await {
+                    Ok(u) => u,
+                    Err(e) => {
+                        // seq out of range (end of playlist) — normal, stop silently
+                        if e.to_string().contains("out of range") {
+                            return;
+                        }
+                        warn!("prefetch seq={seq} resolve failed: {e}");
+                        return;
+                    }
+                };
+                fetch_and_cache(upstream_url, hb, transcode, c, f).await;
+            });
+        }
+    });
+}
+
 // ── /manifest ─────────────────────────────────────────────────────────────────
 
 /// Decide whether a resolved URL from a manifest line is a sub-manifest (→ /manifest)
@@ -368,19 +425,28 @@ fn spawn_prefetch(
 ///     → proxy servers like zaza.animex.one serve every resource (manifest or segment)
 ///       via query params on the root path; when a line resolves to the same host with
 ///       only a query string it is a quality-variant sub-manifest, never raw media.
+///     ⚠ Rule 3 is SUPPRESSED when `is_media_playlist` is true. A media playlist
+///       contains #EXTINF tags so every URL line is a real segment — routing them to
+///       /manifest would cause an infinite loop.
 ///  4. Everything else               — treat as a segment
-fn url_is_sub_manifest(base_url: &str, resolved: &str) -> bool {
+fn url_is_sub_manifest(base_url: &str, resolved: &str, is_media_playlist: bool) -> bool {
     // Rule 1 & 2 — explicit manifest path markers
     if resolved.contains(".m3u8") || resolved.contains("playlist") {
         return true;
     }
 
-    // Rule 3 — same-host, query-only (e.g. zaza.animex.one quality variants)
-    if let (Ok(base), Ok(res)) = (url::Url::parse(base_url), url::Url::parse(resolved)) {
-        let same_host = base.host_str() == res.host_str();
-        let query_only = (res.path() == "/" || res.path().is_empty()) && res.query().is_some();
-        if same_host && query_only {
-            return true;
+    // Rule 3 — same-host, query-only (e.g. zaza.animex.one quality variants).
+    // SUPPRESSED for media playlists: if the manifest contains #EXTINF, every URL
+    // line is a real segment — same-host/query-only URLs are NOT sub-manifests here.
+    // Without this guard, zaza.animex.one segment URLs (same host, query-only path)
+    // would be routed to /manifest instead of /segment, creating an infinite loop.
+    if !is_media_playlist {
+        if let (Ok(base), Ok(res)) = (url::Url::parse(base_url), url::Url::parse(resolved)) {
+            let same_host = base.host_str() == res.host_str();
+            let query_only = (res.path() == "/" || res.path().is_empty()) && res.query().is_some();
+            if same_host && query_only {
+                return true;
+            }
         }
     }
 
@@ -391,7 +457,11 @@ async fn handle_manifest(
     axum::extract::State(state): axum::extract::State<Arc<AppState>>,
     Query(params): Query<ProxyParams>,
 ) -> Response {
-    match proxy_manifest(&params.url, params.headers.as_deref(), &state.playlists, &state.manifests).await {
+    let url = match params.url.as_deref() {
+        Some(u) => u.to_string(),
+        None => return (StatusCode::BAD_REQUEST, "missing url parameter").into_response(),
+    };
+    match proxy_manifest(&url, params.headers.as_deref(), &state.playlists, &state.manifests).await {
         Ok((body, content_type)) => {
             let mut headers = HeaderMap::new();
             headers.insert(
@@ -409,7 +479,7 @@ async fn handle_manifest(
             (StatusCode::OK, headers, body).into_response()
         }
         Err(e) => {
-            error!("manifest error for {}: {e}", params.url);
+            error!("manifest error for {url}: {e}");
             (StatusCode::BAD_GATEWAY, e.to_string()).into_response()
         }
     }
@@ -434,11 +504,28 @@ async fn proxy_manifest(
             return Err(e);
         }
     };
+    let resp_content_type = resp.headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.split(';').next().unwrap_or(s).trim().to_string());
     let body = resp.text().await?;
 
     if !body.trim_start().starts_with("#EXTM3U") {
+        // Upstream returned a 200 but non-HLS body — token probably expired.
+        // Serve the cached rewritten manifest if we have one so the player
+        // keeps working with already-proxied segment URLs.
+        {
+            let cached = manifests.lock().await;
+            if let Some((cached_body, _)) = cached.get(url) {
+                info!("manifest URL did not return #EXTM3U (token expired?), serving cached manifest for {url}");
+                return Ok((cached_body.clone(), "application/vnd.apple.mpegurl".to_string()));
+            }
+        }
+        // No cache yet — nothing we can do but warn. Proxy the raw body so
+        // the caller at least gets *something* rather than a 502.
         warn!("manifest URL did not return #EXTM3U: {url}");
-        return Ok((body, "application/vnd.apple.mpegurl".to_string()));
+        let content_type = resp_content_type.unwrap_or_else(|| "video/mp4".to_string());
+        return Ok((body, content_type));
     }
 
     let needs_transcode = manifest_has_heaac(&body);
@@ -451,6 +538,12 @@ async fn proxy_manifest(
     let headers_b64_str = headers_b64.unwrap_or("");
     let mut out = String::with_capacity(body.len() + 512);
     let mut next_line_is_stream = false;
+
+    // If the manifest contains #EXTINF it is a media playlist (actual segments),
+    // not a master playlist. In that case, same-host query-only URLs are segments,
+    // not quality-variant sub-manifests. Rule 3 of url_is_sub_manifest must be
+    // suppressed so we don't recurse /manifest→/manifest→… forever.
+    let is_media_playlist = body.contains("#EXTINF");
 
     // Collect upstream segment URLs in order for the prefetch index
     let mut segment_urls: Vec<String> = Vec::new();
@@ -466,28 +559,35 @@ async fn proxy_manifest(
             let rewritten = rewrite_uri_attrs(line, url, headers_b64_str, needs_transcode);
             out.push_str(&rewritten);
             out.push('\n');
+            // do NOT reset next_line_is_stream here — a URI= tag line is not a URL line
             continue;
         }
 
         if is_url_line(trimmed) {
             let resolved = resolve_url(url, trimmed);
-            let is_sub_manifest = next_line_is_stream || url_is_sub_manifest(url, &resolved);
+            let is_sub_manifest = next_line_is_stream || url_is_sub_manifest(url, &resolved, is_media_playlist);
             next_line_is_stream = false;
 
-            let endpoint = if is_sub_manifest { "manifest" } else { "segment" };
-
-            // Record segment URLs for prefetch index
-            if endpoint == "segment" {
+            let rewritten = if is_sub_manifest {
+                self_url("manifest", &resolved, headers_b64_str, needs_transcode)
+            } else {
+                // For media-playlist segments, use seq-based indirection so the
+                // actual upstream URL (and its signed token) is re-resolved fresh
+                // at fetch time rather than baked into the rewritten manifest.
+                let seq = segment_urls.len();
                 segment_urls.push(resolved.clone());
-            }
-
-            let rewritten = self_url(endpoint, &resolved, headers_b64_str, needs_transcode);
+                self_segment_url_by_seq(url, seq, headers_b64_str, needs_transcode)
+            };
             out.push_str(&rewritten);
             out.push('\n');
             continue;
         }
 
-        next_line_is_stream = false;
+        // Only reset the flag for non-special comment lines — not for #EXT-X-STREAM-INF
+        // which sets the flag and must keep it set until the next URL line.
+        if !trimmed.starts_with("#EXT-X-STREAM-INF") && !trimmed.starts_with("#EXT-X-I-FRAME-STREAM-INF") {
+            next_line_is_stream = false;
+        }
         out.push_str(line);
         out.push('\n');
     }
@@ -516,7 +616,9 @@ fn rewrite_uri_attrs(line: &str, base_url: &str, headers_b64: &str, _transcode: 
         if let Some(end) = rest.find('"') {
             let inner = &rest[..end];
             let resolved = resolve_url(base_url, inner);
-            let rewritten = self_url("segment", &resolved, headers_b64, false);
+            // URIs in attributes like #EXT-X-MEDIA are media playlists, not segments.
+            // Route them through /manifest to fetch fresh tokens and rewrite again.
+            let rewritten = self_url("manifest", &resolved, headers_b64, false);
             result.push_str(&rewritten);
             result.push('"');
             rest = &rest[end + 1..];
@@ -535,8 +637,34 @@ async fn handle_segment(
     let transcode = params.transcode.as_deref() == Some("1");
     let headers_b64 = params.headers.clone().unwrap_or_default();
 
+    // Resolve the actual upstream segment URL.
+    // If manifest_url+seq are present, re-fetch the playlist for a fresh signed
+    // token; otherwise fall back to the direct url= parameter.
+    let (upstream_url, playlist_url_for_prefetch, seq_for_prefetch) =
+        match (params.manifest_url.as_deref(), params.seq) {
+            (Some(playlist_url_encoded), Some(seq)) => {
+                let playlist_url = urlencoding::decode(playlist_url_encoded)
+                    .unwrap_or_else(|_| std::borrow::Cow::Borrowed(playlist_url_encoded))
+                    .to_string();
+                match resolve_segment_url_from_playlist(&playlist_url, seq, &headers_b64).await {
+                    Ok(u) => (u, Some(playlist_url.clone()), Some(seq)),
+                    Err(e) => {
+                        error!("failed to resolve segment seq={seq} from playlist {playlist_url}: {e}");
+                        return (StatusCode::BAD_GATEWAY, e.to_string()).into_response();
+                    }
+                }
+            }
+            _ => {
+                let u = match params.url.as_deref() {
+                    Some(u) => u.to_string(),
+                    None => return (StatusCode::BAD_REQUEST, "missing url or manifest_url+seq").into_response(),
+                };
+                (u, None, None)
+            }
+        };
+
     match proxy_segment(
-        &params.url,
+        &upstream_url,
         params.headers.as_deref(),
         transcode,
         &state.cache,
@@ -544,15 +672,28 @@ async fn handle_segment(
     .await
     {
         Ok((data, content_type)) => {
-            // Kick off background prefetch of next segments
-            spawn_prefetch(
-                params.url.clone(),
-                headers_b64,
-                transcode,
-                state.cache.clone(),
-                state.playlists.clone(),
-                state.in_flight.clone(),
-            );
+            // Kick off background prefetch of next segments.
+            // For seq-based requests, prefetch by seq index (fresh token per segment).
+            // For direct-URL requests, use the playlist index lookup.
+            if let (Some(pl_url), Some(seq)) = (playlist_url_for_prefetch, seq_for_prefetch) {
+                spawn_prefetch_by_seq(
+                    pl_url,
+                    seq,
+                    headers_b64.clone(),
+                    transcode,
+                    state.cache.clone(),
+                    state.in_flight.clone(),
+                );
+            } else {
+                spawn_prefetch(
+                    upstream_url.clone(),
+                    headers_b64,
+                    transcode,
+                    state.cache.clone(),
+                    state.playlists.clone(),
+                    state.in_flight.clone(),
+                );
+            }
 
             let data_len = data.len();
             let mut headers = HeaderMap::new();
@@ -580,10 +721,34 @@ async fn handle_segment(
             (StatusCode::OK, headers, data).into_response()
         }
         Err(e) => {
-            error!("segment error for {}: {e}", params.url);
+            error!("segment error for {}: {e}", upstream_url);
             (StatusCode::BAD_GATEWAY, e.to_string()).into_response()
         }
     }
+}
+
+/// Re-fetch the media playlist and extract the Nth segment URL (0-based).
+/// This gives us a fresh signed token every time, avoiding 404s from expired URLs.
+async fn resolve_segment_url_from_playlist(
+    playlist_url: &str,
+    seq: usize,
+    headers_b64: &str,
+) -> Result<String> {
+    let extra = decode_headers(Some(headers_b64));
+    let resp = upstream_get(playlist_url, &extra).await
+        .context("re-fetching media playlist for fresh segment URL")?;
+    let body = resp.text().await.context("reading media playlist body")?;
+
+    let segment_urls: Vec<String> = body
+        .lines()
+        .filter(|l| is_url_line(l.trim()))
+        .map(|l| resolve_url(playlist_url, l.trim()))
+        .collect();
+
+    segment_urls
+        .into_iter()
+        .nth(seq)
+        .ok_or_else(|| anyhow!("seq={seq} out of range in playlist ({playlist_url})"))
 }
 
 async fn proxy_segment(
