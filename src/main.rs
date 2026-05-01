@@ -443,11 +443,27 @@ async fn proxy_manifest(
         if is_url_line(trimmed) {
             let resolved = resolve_url(url, trimmed);
             // Detect sub-manifests: either flagged by #EXT-X-STREAM-INF above,
-            // or the URL explicitly contains a manifest path marker.
+            // or the URL explicitly contains a manifest path marker, or it is a
+            // query-only variant of the same host as the base manifest URL
+            // (e.g. zaza.animex.one returns quality variants as "?u=NEW&origin=...")
+            // which are always sub-manifests, never raw segments.
+            let same_host_query_only = {
+                let base_host = url::Url::parse(url).ok().and_then(|u| u.host_str().map(|h| h.to_string()));
+                let resolved_parsed = url::Url::parse(&resolved).ok();
+                match (base_host, resolved_parsed) {
+                    (Some(bh), Some(rp)) => {
+                        let same_host = rp.host_str() == Some(bh.as_str());
+                        let query_only = rp.path() == "/" || rp.path().is_empty();
+                        same_host && query_only && rp.query().is_some()
+                    }
+                    _ => false,
+                }
+            };
             let is_sub_manifest = next_line_is_stream
                 || resolved.contains(".m3u8")
                 || resolved.contains("playlist")
-                || resolved.contains("index.m3u8");
+                || resolved.contains("index.m3u8")
+                || same_host_query_only;
             next_line_is_stream = false;
 
             let endpoint = if is_sub_manifest { "manifest" } else { "segment" };
