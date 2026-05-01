@@ -610,15 +610,21 @@ async fn proxy_manifest(
 fn rewrite_uri_attrs(line: &str, base_url: &str, headers_b64: &str, _transcode: bool) -> String {
     let mut result = String::new();
     let mut rest = line;
+    // Detect if this is an EXT-X-KEY line — its URI is a binary key, not a playlist.
+    let is_key_line = line.trim_start().starts_with("#EXT-X-KEY");
     while let Some(start) = rest.find("URI=\"") {
         result.push_str(&rest[..start + 5]);
         rest = &rest[start + 5..];
         if let Some(end) = rest.find('"') {
             let inner = &rest[..end];
             let resolved = resolve_url(base_url, inner);
-            // URIs in attributes like #EXT-X-MEDIA are media playlists, not segments.
-            // Route them through /manifest to fetch fresh tokens and rewrite again.
-            let rewritten = self_url("manifest", &resolved, headers_b64, false);
+            let rewritten = if is_key_line {
+                // AES-128 key: proxy as a raw segment (16 bytes), not a manifest.
+                self_url("segment", &resolved, headers_b64, false)
+            } else {
+                // URIs in #EXT-X-MEDIA etc. are media playlists — rewrite via /manifest.
+                self_url("manifest", &resolved, headers_b64, false)
+            };
             result.push_str(&rewritten);
             result.push('"');
             rest = &rest[end + 1..];
