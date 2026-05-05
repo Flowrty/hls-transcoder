@@ -37,12 +37,12 @@ use tracing::{error, info, warn};
 // ── Constants ─────────────────────────────────────────────────────────────────
 
 /// How many segments ahead to prefetch after each request.
-/// 8 segments × ~10s each = ~80s of buffer, enough for a 10s skip with margin.
-const PREFETCH_AHEAD: usize = 8;
+/// Reduced for Railway Free Tier to minimize background CPU usage.
+const PREFETCH_AHEAD: usize = 3;
 
-/// Max segments to keep in RAM. Each segment ~400 KB → 30 segments ≈ 12 MB.
-/// Kept low for Koyeb free tier (512 MB RAM total).
-const CACHE_MAX_SEGMENTS: usize = 30;
+/// Max segments to keep in RAM. Each segment ~400 KB → 25 segments ≈ 10 MB.
+/// Kept low for Railway free tier (512 MB RAM total).
+const CACHE_MAX_SEGMENTS: usize = 25;
 
 /// Evict cache entries older than this (covers a full episode).
 const CACHE_TTL: Duration = Duration::from_secs(3600);
@@ -76,6 +76,8 @@ struct AppState {
     playlists: PlaylistIndex,
     in_flight: InFlight,
     manifests: ManifestCache,
+    /// Limits concurrent FFmpeg processes to prevent CPU starvation.
+    ffmpeg_sem: Arc<tokio::sync::Semaphore>,
 }
 
 // ── Shared HTTP client ────────────────────────────────────────────────────────
@@ -125,6 +127,8 @@ async fn main() {
         playlists: Arc::new(Mutex::new(HashMap::new())),
         in_flight: Arc::new(Mutex::new(std::collections::HashSet::new())),
         manifests: Arc::new(Mutex::new(HashMap::new())),
+        // 4 concurrent FFmpeg tasks is a good balance for 1 vCPU.
+        ffmpeg_sem: Arc::new(tokio::sync::Semaphore::new(4)),
     });
 
     let cors = CorsLayer::new()
@@ -323,6 +327,7 @@ async fn fetch_and_cache(
     transcode: bool,
     cache: SegmentCache,
     in_flight: InFlight,
+    ffmpeg_sem: Arc<tokio::sync::Semaphore>,
 ) {
     // Skip if already cached
     if cache_get(&cache, &upstream_url).await.is_some() {
@@ -364,6 +369,15 @@ async fn fetch_and_cache(
     let (data, content_type) = if data.len() == 16 || content_length == 16 {
         (data, "application/octet-stream".to_string())
     } else if transcode {
+        // BEST EFFORT: Skip prefetch if CPU is busy with active users
+        let _permit = match ffmpeg_sem.try_acquire() {
+            Ok(p) => p,
+            Err(_) => {
+                in_flight.lock().await.remove(&upstream_url);
+                return;
+            }
+        };
+
         match ffmpeg_transcode(data).await {
             Ok(t) => (t, "video/mp4".to_string()),
             Err(e) => {
@@ -399,6 +413,7 @@ fn spawn_prefetch(
     cache: SegmentCache,
     playlists: PlaylistIndex,
     in_flight: InFlight,
+    ffmpeg_sem: Arc<tokio::sync::Semaphore>,
 ) {
     tokio::spawn(async move {
         // Find current segment's position in the playlist
@@ -425,8 +440,9 @@ fn spawn_prefetch(
             let h = headers_b64.clone();
             let c = cache.clone();
             let f = in_flight.clone();
+            let s = ffmpeg_sem.clone();
             tokio::spawn(async move {
-                fetch_and_cache(u, h, transcode, c, f).await;
+                fetch_and_cache(u, h, transcode, c, f, s).await;
             });
         }
     });
@@ -442,6 +458,7 @@ fn spawn_prefetch_by_seq(
     transcode: bool,
     cache: SegmentCache,
     in_flight: InFlight,
+    ffmpeg_sem: Arc<tokio::sync::Semaphore>,
 ) {
     tokio::spawn(async move {
         for offset in 1..=PREFETCH_AHEAD {
@@ -450,6 +467,8 @@ fn spawn_prefetch_by_seq(
             let hb = headers_b64.clone();
             let c = cache.clone();
             let f = in_flight.clone();
+            let s = ffmpeg_sem.clone();
+
             tokio::spawn(async move {
                 let upstream_url = match resolve_segment_url_from_playlist(&pl, seq, &hb).await {
                     Ok(u) => u,
@@ -462,7 +481,7 @@ fn spawn_prefetch_by_seq(
                         return;
                     }
                 };
-                fetch_and_cache(upstream_url, hb, transcode, c, f).await;
+                fetch_and_cache(upstream_url, hb, transcode, c, f, s).await;
             });
         }
     });
@@ -733,6 +752,7 @@ async fn handle_segment(
         params.headers.as_deref(),
         transcode,
         &state.cache,
+        &state.ffmpeg_sem,
     )
     .await
     {
@@ -748,6 +768,7 @@ async fn handle_segment(
                     transcode,
                     state.cache.clone(),
                     state.in_flight.clone(),
+                    state.ffmpeg_sem.clone(),
                 );
             } else {
                 spawn_prefetch(
@@ -757,6 +778,7 @@ async fn handle_segment(
                     state.cache.clone(),
                     state.playlists.clone(),
                     state.in_flight.clone(),
+                    state.ffmpeg_sem.clone(),
                 );
             }
 
@@ -821,6 +843,7 @@ async fn proxy_segment(
     headers_b64: Option<&str>,
     transcode: bool,
     cache: &SegmentCache,
+    ffmpeg_sem: &Arc<tokio::sync::Semaphore>,
 ) -> Result<(Bytes, String)> {
     // Serve from cache if available (instant for already-prefetched segments)
     if let Some(entry) = cache_get(cache, url).await {
@@ -851,6 +874,9 @@ async fn proxy_segment(
     }
 
     let (data, content_type) = if transcode {
+        // HIGH PRIORITY: Wait for CPU to become available
+        let _permit = ffmpeg_sem.acquire().await.context("failed to acquire ffmpeg permit")?;
+
         match ffmpeg_transcode(data).await {
             Ok(t) => (t, "video/mp4".to_string()),
             Err(e) => {
@@ -887,6 +913,7 @@ async fn ffmpeg_remux(input: Bytes) -> Result<Bytes> {
         .args([
             "-hide_banner",
             "-loglevel", "error",
+            "-threads", "1",
             "-i", "pipe:0",
             "-c:v", "copy",
             "-c:a", "copy",
@@ -923,6 +950,7 @@ async fn ffmpeg_transcode(input: Bytes) -> Result<Bytes> {
         .args([
             "-hide_banner",
             "-loglevel", "error",
+            "-threads", "1",
             "-i", "pipe:0",
             "-c:v", "copy",
             "-c:a", "aac",
